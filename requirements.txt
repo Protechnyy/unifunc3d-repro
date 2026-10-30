@@ -1,2 +1,12 @@
 # CPU evaluation and prediction validation
 numpy>=1.24,<3
+pandas
+open3d
+plyfile
+imageio
+opencv-python
+moviepy>=2.0.0
+scipy
+tqdm
+tyro
+viser

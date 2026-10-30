@@ -7,3 +7,7 @@ outputs/
 *.npz
 *.pt
 *.safetensors
+arXiv-2603.23478v2/
+models/
+data/
+.vscode/
