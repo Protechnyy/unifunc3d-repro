@@ -14,7 +14,7 @@ def main():
     parser.add_argument("command", choices=["audit", "run"])
     parser.add_argument("--dataset-root", type=Path, default=Path("data/scenefun3d"))
     parser.add_argument("--split", choices=["val", "train"], default="val")
-    parser.add_argument("--output", type=Path, default=Path("outputs/reproduction_8b"))
+    parser.add_argument("--output", type=Path, default=Path("outputs/inference"))
     parser.add_argument("--visits", nargs="+")
     parser.add_argument("--limit-scenes", type=int, default=0)
     parser.add_argument("--limit-queries", type=int, default=0)

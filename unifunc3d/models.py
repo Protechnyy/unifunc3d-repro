@@ -22,9 +22,16 @@ class Qwen:
             from .torch_utils import LinearPatchEmbedding
             visual = self.model.model.visual
             visual.patch_embed = LinearPatchEmbedding(visual.patch_embed)
+        from .feature_cache import VisualFeatureCache
+        self.visual_cache = VisualFeatureCache(self.model.model.get_image_features)
+        self.model.model.get_image_features = self.visual_cache
 
     def ask(self, images, prompt, tagged=False, max_pixels=None):
         import torch
+        from .feature_cache import image_key
+        # Coarse image groups repeat across descriptions within the same scene.
+        # Fine/overlay images bypass this cache to preserve space for those groups.
+        self.visual_cache.key = image_key(images, max_pixels) if tagged else None
         content = []
         for i in range(len(images)):
             if tagged:
@@ -45,6 +52,7 @@ class Qwen:
         log.info("Qwen %d images / %d tokens / %.1fs: %s", len(images), length,
                  time.monotonic() - started, answer)
         return {"text": answer, "input_tokens": length, "seconds": time.monotonic() - started}
+
 
 
 class SAM3:

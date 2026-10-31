@@ -155,7 +155,3 @@ def compare_row(actual, expected, context):
         tolerance = 0 if metric in {"pred_count", "mAP", "AP50", "AP25", "mAR", "AR50", "AR25"} else 1e-7
         if not np.isfinite(value) or abs(value - expected[metric]) > tolerance:
             raise ValueError(f"{context}: {metric}: {value} != {expected[metric]}")
-
-
-def manifest():
-    return read_json(ROOT / "release_manifest.json")

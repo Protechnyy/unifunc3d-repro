@@ -4,6 +4,7 @@ import fcntl
 import json
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
 
@@ -11,7 +12,7 @@ import numpy as np
 
 from release_lib.common import read_json, sha256, write_json
 from .data import InputScene
-from .geometry import agreement, lift_frame
+from .geometry import agreement, ProjectionCache
 from .grounding import (coarse_indices, coarse_prompt, fine_prompt, parse_grounding,
                         parse_verification, verify_prompt, window_indices)
 from .models import Qwen, SAM3, overlay
@@ -40,8 +41,13 @@ class Pipeline:
             raise ValueError("Output has a different configuration; choose a new output directory")
         write_json(config_path, recorded, pretty=True)
         self.coarse_images = CoarseImageCache()
+        self.prefetch_pool = ThreadPoolExecutor(max_workers=2)
+        self.projection_pool = ThreadPoolExecutor(max_workers=1)
+        self.projection_cache = None
 
     def close(self):
+        self.prefetch_pool.shutdown(wait=True)
+        self.projection_pool.shutdown(wait=True)
         self.coarse_images.close()
         self._lock.close()
 
@@ -105,7 +111,37 @@ class Pipeline:
         # One vote per unique camera frame; overlapping windows must not multiply votes.
         accepted_per_frame = {}
         fine_records = []
+        if self.projection_cache is None or self.projection_cache.xyz is not scene.xyz:
+            self.projection_cache = ProjectionCache(scene.xyz)
+        jobs = []
         for (frame_key, obj), (frame, _) in candidates.items():
+            suffix = hashlib.sha256(obj.encode()).hexdigest()[:12]
+            prefix = directory / f"fine_{frame_key}_{suffix}"
+            cached = (directory / (prefix.name + ".json")).exists() and (directory / (prefix.name + ".npz")).exists()
+            jobs.append((frame_key, obj, frame, cached))
+        image_futures = {}
+        # Bound decoded images to the current frame plus two lookahead frames.
+        def prefetch(index):
+            if index < len(jobs) and not jobs[index][3]:
+                image_futures[index] = self.prefetch_pool.submit(jobs[index][2].image, config.upright)
+        for index in range(min(3, len(jobs))):
+            prefetch(index)
+        pending_projection = None
+        def collect_projection(pending):
+            record, indices = pending.result()
+            accepted_per_frame.setdefault(record['frame'], []).append(indices)
+            fine_records.append(record)
+        def project_and_save(verified, frame, parsed, mask_records, obj, mask_path, record_path):
+            indices = self.projection_cache.lift(verified, frame, config.upright,
+                                                config.visibility_tolerance) if verified.any() else np.empty(0, dtype=np.int64)
+            record = {"frame": frame.key, "object": obj, "points": parsed["points"],
+                      "masks": mask_records, "lifted_points": len(indices)}
+            with mask_path.with_suffix(".npz.tmp").open("wb") as f:
+                np.savez_compressed(f, indices=indices)
+            mask_path.with_suffix(".npz.tmp").replace(mask_path)
+            write_json(record_path, record, pretty=True)
+            return record, indices
+        for job_index, (frame_key, obj, frame, cached) in enumerate(jobs):
             suffix = hashlib.sha256(obj.encode()).hexdigest()[:12]
             prefix = directory / f"fine_{frame_key}_{suffix}"
             # Frame keys contain decimal timestamps. with_suffix() would remove
@@ -117,7 +153,8 @@ class Pipeline:
                 with np.load(mask_path, allow_pickle=False) as saved:
                     indices = saved["indices"]
             else:
-                image = frame.image(config.upright)
+                image = image_futures.pop(job_index).result()
+                prefetch(job_index + 3)
                 response = self.ask(directory / f"ground_{frame_key}_{suffix}.json", [image], fine_prompt(task, obj))
                 parsed = parse_grounding(response["text"])
                 verified = np.zeros((image.height, image.width), dtype=bool)
@@ -138,17 +175,18 @@ class Pipeline:
                                              "verification": verification["text"]})
                         if accepted:
                             verified |= candidate["mask"]
-                indices = lift_frame(scene.xyz, verified, frame, config.upright,
-                                     config.visibility_tolerance) if verified.any() else np.empty(0, dtype=np.int64)
-                record = {"frame": frame_key, "object": obj, "points": parsed["points"],
-                          "masks": mask_records, "lifted_points": len(indices)}
-                # NPZ first; the JSON file is the commit marker for a completed frame.
-                with mask_path.with_suffix(".npz.tmp").open("wb") as f:
-                    np.savez_compressed(f, indices=indices)
-                mask_path.with_suffix(".npz.tmp").replace(mask_path)
-                write_json(record_path, record, pretty=True)
+                # Complete the previous projection before queuing another, so CPU
+                # work and retained masks stay bounded while overlapping GPU work.
+                if pending_projection is not None:
+                    collect_projection(pending_projection)
+                pending_projection = self.projection_pool.submit(
+                    project_and_save, verified, frame, parsed, mask_records, obj, mask_path, record_path)
+                continue
+            prefetch(job_index + 3)
             accepted_per_frame.setdefault(frame_key, []).append(indices)
             fine_records.append(record)
+        if pending_projection is not None:
+            collect_projection(pending_projection)
         for chunks in accepted_per_frame.values():
             indices = np.unique(np.concatenate(chunks))
             votes[indices] += 1
@@ -158,7 +196,14 @@ class Pipeline:
                    "frames_with_accepted_points": sum(any(len(x) for x in xs) for xs in accepted_per_frame.values()),
                    "max_votes": int(votes.max(initial=0)), "predicted_points": len(prediction),
                    "seconds_this_invocation": time.monotonic() - started,
+                   "projection_cache": {"hits": self.projection_cache.hits,
+                                        "misses": self.projection_cache.misses,
+                                        "bytes": self.projection_cache.bytes},
                    "fine": fine_records}
+        if self.qwen is not None and hasattr(self.qwen, "visual_cache"):
+            summary["visual_cache"] = {"hits": self.qwen.visual_cache.hits,
+                                       "misses": self.qwen.visual_cache.misses,
+                                       "bytes": self.qwen.visual_cache.bytes}
         write_json(directory / "summary.json", summary, pretty=True)
         nz = np.flatnonzero(votes)
         np.savez_compressed(directory / "votes.npz", indices=nz, votes=votes[nz], n_points=len(votes))
@@ -169,6 +214,9 @@ class Pipeline:
         pred_dir.mkdir(exist_ok=True)
         for visit in visits:
             self.coarse_images.clear()
+            self.projection_cache = None
+            if self.qwen is not None:
+                self.qwen.visual_cache.clear()
             scene = InputScene(root, split, visit, self.config.max_videos)
             snapshot = {"dataset_root": str(Path(root).resolve()), "split": split,
                         "n_points": len(scene.xyz), "files": {}}

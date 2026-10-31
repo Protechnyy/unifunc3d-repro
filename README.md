@@ -49,7 +49,7 @@ Indices are sorted, unique, zero-based positions in the **cropped laser scan**, 
 
 ## Evaluation
 
-Evaluation runs on CPU and requires only NumPy; model weights are not needed.
+Evaluation runs on CPU; model weights are not needed.
 
 ```bash
 python -m pip install -r requirements.txt
@@ -81,8 +81,6 @@ The split CSVs are bundled in [datasets/benchmark_file_lists](datasets/benchmark
 
 **Metric convention.** We follow the historical Fun3DU point precision/recall threshold protocol. AP25/AP50 indicate whether point precision reaches 0.25/0.50; AR25/AR50 use point recall. mAP/mAR average these indicators over thresholds 0.50, 0.55, ..., 0.95. mIoU is point intersection over union. All metrics are averaged over descriptions; empty predictions have zero precision. These AP values are not instance-detection AP. Ground-truth masks union the existing non-`exclude` annotations referenced by each description, then apply the crop mask.
 
-Evaluation regression checks can be run with `python -m unittest discover -s tests -v`. After intentional file edits, regenerate hashes with `python tools/update_checksums.py` before running `python verify_release.py`.
-
 ## Citation
 
 ```bibtex
@@ -97,3 +95,20 @@ Evaluation regression checks can be run with `python -m unittest discover -s tes
 ## Acknowledgements
 
 We thank [Fun3DU](https://github.com/tev-fbk/fun3du), [SceneFun3D](https://github.com/SceneFun3D/scenefun3d), [Qwen3](https://github.com/QwenLM/Qwen3), and [SAM3](https://github.com/facebookresearch/sam3). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attribution and upstream terms.
+
+## Local inference
+
+Independent Qwen3-VL-8B + SAM3 implementation with supplemented part-localization prompts.
+Requires Python 3.12, a CUDA-capable GPU, `models/Qwen3-VL-8B-Instruct`, and `models/sam3/sam3.pt`.
+
+```bash
+python -m pip install -r requirements.txt
+python tools/check_inference_environment.py
+python tools/run_validation.py --config configs/qwen3_vl_8b.json \
+  --output outputs/qwen3_vl_8b_val \
+  --metadata-overrides configs/val_description_overrides.json
+```
+
+The command resumes existing predictions and evaluates all 445 validation queries on completion.
+The metadata override allows the audited description-file hash for scene 437294.
+Progress: `outputs/qwen3_vl_8b_val/status.json`; final metrics: `evaluation.json` and `comparison.json` in the same directory.

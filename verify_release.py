@@ -2,7 +2,9 @@
 """Check file hashes, prediction schemas, split coverage and index bounds."""
 import argparse
 
-from release_lib.common import ROOT, manifest, read_json, read_predictions, sha256
+from release_lib.experiments import EXPERIMENTS
+
+from release_lib.common import ROOT, read_json, read_predictions, sha256
 
 
 def verify(checksums=True):
@@ -12,7 +14,7 @@ def verify(checksums=True):
             if sha256(ROOT / relative) != expected:
                 raise ValueError(f"Checksum mismatch: {relative}")
     summary = []
-    for key, experiment in manifest()["experiments"].items():
+    for key, experiment in EXPERIMENTS.items():
         scenes = read_json(ROOT / "datasets" / f"{experiment['split']}.json")
         directory = ROOT / experiment["predictions"]
         if {p.stem for p in directory.glob("*.json")} != set(scenes):

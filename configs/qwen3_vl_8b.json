@@ -1,5 +1,5 @@
 {
-  "qwen_model": "models/RynnBrain-8B",
+  "qwen_model": "models/Qwen3-VL-8B-Instruct",
   "coarse_frames": 64,
   "iterations": 4,
   "coarse_width": 512,

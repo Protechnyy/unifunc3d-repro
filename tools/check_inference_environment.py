@@ -9,7 +9,11 @@ from pathlib import Path
 
 def check(model_root, vlm_name="Qwen3-VL-8B-Instruct"):
     import torch
+    # Package metadata can survive a deleted editable-install source directory.
+    from sam3.model_builder import build_sam3_image_model
+    from sam3.model.sam3_image_processor import Sam3Processor
     report = {"packages": {}, "models": {}, "cuda": {}}
+    report["sam3_importable"] = True
     for name in ("torch", "torchvision", "transformers", "accelerate", "sam3", "numpy", "scipy", "plyfile"):
         report["packages"][name] = importlib.metadata.version(name)
     for name in (vlm_name, "sam3"):

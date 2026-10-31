@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+
+from release_lib.experiments import EXPERIMENTS
 from pathlib import Path
 
 import numpy as np
 
-from release_lib.common import (ROOT, METRICS, Scene, compare_row, manifest,
+from release_lib.common import (ROOT, METRICS, Scene, compare_row,
                                 read_json, read_predictions, reference_rows,
                                 scores_for_indices, visits_for_split, write_json)
 
@@ -57,7 +59,7 @@ def main():
                         help="Fail if any query metric/count or the published table differs")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    experiments = manifest()["experiments"]
+    experiments = EXPERIMENTS
     if args.experiment != "all" and args.experiment not in experiments:
         parser.error(f"Choose all or {', '.join(experiments)}")
     results = [evaluate(k, v, args.dataset_root, args.check_reference)
