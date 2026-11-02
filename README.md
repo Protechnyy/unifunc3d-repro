@@ -98,7 +98,14 @@ We thank [Fun3DU](https://github.com/tev-fbk/fun3du), [SceneFun3D](https://githu
 
 ## Local inference
 
-Independent Qwen3-VL-8B + SAM3 implementation with supplemented part-localization prompts.
+Frozen Qwen3-VL-8B + SAM3 pipeline:
+
+1. Multi-offset uniform sampling: 64 original-resolution frames per round, 4 rounds with different temporal offsets.
+2. Joint reasoning and frame selection: Qwen3-VL outputs its reasoning, the interaction task type, the SceneFun3D affordance type, the target object, the functional element, the instance constraints copied from the task and up to 4 frame IDs (JSON); selections are aggregated and deduplicated per frame and semantic hypothesis.
+3. Single-frame localization on each selected original-resolution frame.
+4. SAM3 point-prompt masks, Qwen3-VL verification, depth-tested 3D lifting and vote agreement.
+
+Predictions are written to `predictions/` inside the output directory.
 Requires Python 3.12, a CUDA-capable GPU, `models/Qwen3-VL-8B-Instruct`, and `models/sam3/sam3.pt`.
 
 ```bash

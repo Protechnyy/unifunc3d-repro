@@ -1,9 +1,9 @@
-"""CPU-only coarse image cache; preserve the original decode/rotation/resize."""
+"""CPU-only image cache; preserve the original decode/rotation."""
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
 
-class CoarseImageCache:
+class ImageCache:
     def __init__(self, capacity=1024, workers=8):
         self.capacity = capacity
         self.images = OrderedDict()
@@ -16,18 +16,16 @@ class CoarseImageCache:
         self.pool.shutdown(wait=True)
         self.clear()
 
-    def get(self, frames, upright, width, height):
-        keys = [(str(f.rgb), f.rotation, upright, width, height,
+    def get(self, frames, upright):
+        keys = [(str(f.rgb), f.rotation, upright,
                  f.rgb.stat().st_size, f.rgb.stat().st_mtime_ns) for f in frames]
         missing = {k: f for k, f in zip(keys, frames) if k not in self.images}
 
         def decode(item):
             key, frame = item
-            im = frame.image(upright)
-            size = (width, height) if im.width >= im.height else (height, width)
-            return key, im.resize(size)
+            return key, frame.image(upright)
 
-        # Read/resize independent images concurrently; return in original order.
+        # Read independent images concurrently; return in original order.
         loaded = dict(self.pool.map(decode, missing.items()))
         result = []
         for key in keys:

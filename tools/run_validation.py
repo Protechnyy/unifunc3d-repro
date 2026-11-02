@@ -92,7 +92,7 @@ def main():
                       'paper_8b_percent': paper,
                       'delta_vs_paper_percentage_points': {k: round(result['percent']['ours'][k] - v, 4) for k, v in paper.items()},
                       'metadata_overrides': result['metadata_overrides'],
-                      'note': 'Independent reconstruction with the configured local model and supplemented prompts; exact author checkpoint revision is unspecified.'}
+                      'note': 'Qwen3-VL joint reasoning and frame selection, single-frame localization on the selected frames.'}
         write_json(out / 'comparison.json', comparison, pretty=True)
         status.update(state='completed', completed_queries=result['queries'], completed_scenes=result['scenes'],
                       finished_utc=datetime.datetime.now(datetime.timezone.utc).isoformat())

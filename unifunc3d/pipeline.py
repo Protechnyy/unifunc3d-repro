@@ -13,12 +13,18 @@ import numpy as np
 from release_lib.common import read_json, sha256, write_json
 from .data import InputScene
 from .geometry import agreement, ProjectionCache
-from .grounding import (coarse_indices, coarse_prompt, fine_prompt, parse_grounding,
-                        parse_verification, verify_prompt, window_indices)
+from .grounding import (localization_prompt, parse_grounding, parse_selection, parse_verification,
+                        sample_indices, selection_prompt, verify_prompt)
 from .models import Qwen, SAM3, overlay
-from .image_cache import CoarseImageCache
+from .image_cache import ImageCache
 
 log = logging.getLogger(__name__)
+HYPOTHESIS_FIELDS = ("target_object", "functional_element", "affordance_type", "instance_constraints")
+
+
+def hypothesis_suffix(record):
+    return hashlib.sha256(json.dumps({k: record[k] for k in HYPOTHESIS_FIELDS},
+                                     sort_keys=True).encode()).hexdigest()[:12]
 
 
 class Pipeline:
@@ -40,15 +46,14 @@ class Pipeline:
             self._lock.close()
             raise ValueError("Output has a different configuration; choose a new output directory")
         write_json(config_path, recorded, pretty=True)
-        self.coarse_images = CoarseImageCache()
-        self.prefetch_pool = ThreadPoolExecutor(max_workers=2)
+        # Original-resolution frames, reused across descriptions of the same scene.
+        self.images = ImageCache()
         self.projection_pool = ThreadPoolExecutor(max_workers=1)
         self.projection_cache = None
 
     def close(self):
-        self.prefetch_pool.shutdown(wait=True)
         self.projection_pool.shutdown(wait=True)
-        self.coarse_images.close()
+        self.images.close()
         self._lock.close()
 
     def __enter__(self):
@@ -67,6 +72,73 @@ class Pipeline:
         write_json(path, result, pretty=True)
         return result
 
+    def select(self, directory, scene, task):
+        config = self.config
+        records = []
+        candidates = {}
+        for video_id, frames in scene.videos.items():
+            for iteration in range(config.iterations):
+                sampled = sample_indices(len(frames), config.frames_per_round, config.iterations, iteration)
+                path = directory / f"select_{video_id}_{iteration}.json"
+                images = []
+                if not path.exists():
+                    images = self.images.get([frames[i] for i in sampled], config.upright)
+                response = self.ask(path, images, selection_prompt(task),
+                                    labels=[f"<frame {i}>:" for i in range(len(sampled))], cache=True,
+                                    long_context=True)
+                parsed = parse_selection(response["text"], len(sampled), config.max_selected_frames)
+                records.append({"video_id": video_id, "iteration": iteration, "sampled_indices": sampled,
+                                **parsed, "frames": [frames[sampled[i]].key for i in parsed["frame_ids"]]})
+                if parsed["error"]:
+                    log.warning("Invalid selection %s: %s", path, parsed["error"])
+                    continue
+                hypothesis = {k: parsed[k] for k in HYPOTHESIS_FIELDS}
+                for i in parsed["frame_ids"]:
+                    frame = frames[sampled[i]]
+                    # Localize each (frame, hypothesis) pair once.
+                    candidates.setdefault((frame.key, json.dumps(hypothesis, sort_keys=True)),
+                                          {"frame": frame, "hypothesis": hypothesis})
+        return records, list(candidates.values())
+
+    def localize(self, directory, task, candidate, prefix):
+        config = self.config
+        frame, hypothesis = candidate["frame"], candidate["hypothesis"]
+        image = self.images.get([frame], config.upright)[0]
+        response = self.ask(directory / f"ground_{prefix}.json", [image],
+                            localization_prompt(task, hypothesis))
+        points = parse_grounding(response["text"])
+        verified = np.zeros((image.height, image.width), dtype=bool)
+        mask_records = []
+        if points:
+            if self.sam is None:
+                self.sam = SAM3(config)
+            for m, candidate_mask in enumerate(self.sam.segment(image, points)):
+                highlighted = overlay(image, candidate_mask["mask"], config.overlay_alpha)
+                verification = self.ask(directory / f"verify_{prefix}_{m}.json", [highlighted],
+                                        verify_prompt(task, hypothesis))
+                accepted = parse_verification(verification["text"])
+                highlighted.thumbnail((960, 960))
+                highlighted.save(directory / f"overlay_{prefix}_{m}.jpg", quality=90)
+                mask_records.append({"point": candidate_mask["point"], "score": candidate_mask["score"],
+                                     "pixels": int(candidate_mask["mask"].sum()), "accepted": accepted,
+                                     "verification": verification["text"]})
+                if accepted:
+                    verified |= candidate_mask["mask"]
+        record = {"frame": frame.key, **hypothesis, "response": response["text"],
+                  "points": points, "masks": mask_records}
+        return record, verified
+
+    def project_and_save(self, record, verified, frame, mask_path, record_path):
+        config = self.config
+        indices = self.projection_cache.lift(verified, frame, config.upright,
+                                             config.visibility_tolerance) if verified.any() else np.empty(0, dtype=np.int64)
+        record["lifted_points"] = len(indices)
+        with mask_path.with_suffix(".npz.tmp").open("wb") as f:
+            np.savez_compressed(f, indices=indices)
+        mask_path.with_suffix(".npz.tmp").replace(mask_path)
+        write_json(record_path, record, pretty=True)
+        return record, indices
+
     def query(self, scene, description):
         config = self.config
         started = time.monotonic()
@@ -77,143 +149,69 @@ class Pipeline:
             raise ValueError("Description changed since cache creation")
         write_json(desc_path, description, pretty=True)
         task = description["description"]
-        candidates = {}
-        coarse_records = []
-        for video_id, frames in scene.videos.items():
-            for iteration in range(config.iterations):
-                sampled = coarse_indices(len(frames), config.coarse_frames, config.iterations, iteration)
-                path = directory / f"coarse_{video_id}_{iteration}.json"
-                images = []
-                if not path.exists():
-                    images = self.coarse_images.get([frames[i] for i in sampled], config.upright,
-                                                    config.coarse_width, config.coarse_height)
-                response = self.ask(path, images, coarse_prompt(task, config.part_aware_prompt), tagged=True,
-                                    max_pixels=config.coarse_width * config.coarse_height)
-                parsed = parse_grounding(response["text"], len(sampled))
-                record = {"video_id": video_id, "iteration": iteration,
-                          "sampled_indices": sampled, **parsed}
-                coarse_records.append(record)
-                if parsed["frame"] is None or not parsed["functional_object"]:
-                    log.warning("Invalid coarse candidate: %s", path)
-                    continue
-                center = sampled[parsed["frame"]]
-                selected = window_indices([f.timestamp for f in frames], center, config.coarse_frames)
-                if config.max_fine_frames and len(selected) > config.max_fine_frames:
-                    subset = np.linspace(0, len(selected) - 1, config.max_fine_frames).round().astype(int)
-                    selected = [selected[i] for i in subset]
-                for i in selected:
-                    # Retain different semantic hypotheses, deduplicate identical frame/object pairs.
-                    obj = parsed["functional_object"]
-                    candidates[(frames[i].key, obj)] = (frames[i], obj)
-        write_json(directory / "coarse_summary.json", coarse_records, pretty=True)
-        log.info("%s: %d fine frame/object candidates", description["desc_id"], len(candidates))
-        votes = np.zeros(len(scene.xyz), dtype=np.uint32)
-        # One vote per unique camera frame; overlapping windows must not multiply votes.
-        accepted_per_frame = {}
-        fine_records = []
+        selection_records, candidates = self.select(directory, scene, task)
+        write_json(directory / "selection_summary.json", {
+            "calls": selection_records,
+            "candidates": [{"frame": c["frame"].key, **c["hypothesis"]} for c in candidates]}, pretty=True)
+        log.info("%s: %d frame/hypothesis candidates", description["desc_id"], len(candidates))
         if self.projection_cache is None or self.projection_cache.xyz is not scene.xyz:
             self.projection_cache = ProjectionCache(scene.xyz)
-        jobs = []
-        for (frame_key, obj), (frame, _) in candidates.items():
-            suffix = hashlib.sha256(obj.encode()).hexdigest()[:12]
-            prefix = directory / f"fine_{frame_key}_{suffix}"
-            cached = (directory / (prefix.name + ".json")).exists() and (directory / (prefix.name + ".npz")).exists()
-            jobs.append((frame_key, obj, frame, cached))
-        image_futures = {}
-        # Bound decoded images to the current frame plus two lookahead frames.
-        def prefetch(index):
-            if index < len(jobs) and not jobs[index][3]:
-                image_futures[index] = self.prefetch_pool.submit(jobs[index][2].image, config.upright)
-        for index in range(min(3, len(jobs))):
-            prefetch(index)
-        pending_projection = None
-        def collect_projection(pending):
-            record, indices = pending.result()
-            accepted_per_frame.setdefault(record['frame'], []).append(indices)
-            fine_records.append(record)
-        def project_and_save(verified, frame, parsed, mask_records, obj, mask_path, record_path):
-            indices = self.projection_cache.lift(verified, frame, config.upright,
-                                                config.visibility_tolerance) if verified.any() else np.empty(0, dtype=np.int64)
-            record = {"frame": frame.key, "object": obj, "points": parsed["points"],
-                      "masks": mask_records, "lifted_points": len(indices)}
-            with mask_path.with_suffix(".npz.tmp").open("wb") as f:
-                np.savez_compressed(f, indices=indices)
-            mask_path.with_suffix(".npz.tmp").replace(mask_path)
-            write_json(record_path, record, pretty=True)
-            return record, indices
-        for job_index, (frame_key, obj, frame, cached) in enumerate(jobs):
-            suffix = hashlib.sha256(obj.encode()).hexdigest()[:12]
-            prefix = directory / f"fine_{frame_key}_{suffix}"
-            # Frame keys contain decimal timestamps. with_suffix() would remove
-            # the fractional timestamp AND the object hash, aliasing frames.
-            record_path = prefix.parent / (prefix.name + ".json")
-            mask_path = prefix.parent / (prefix.name + ".npz")
-            if record_path.exists() and mask_path.exists():
-                record = read_json(record_path)
-                with np.load(mask_path, allow_pickle=False) as saved:
-                    indices = saved["indices"]
-            else:
-                image = image_futures.pop(job_index).result()
-                prefetch(job_index + 3)
-                response = self.ask(directory / f"ground_{frame_key}_{suffix}.json", [image], fine_prompt(task, obj))
-                parsed = parse_grounding(response["text"])
-                verified = np.zeros((image.height, image.width), dtype=bool)
-                mask_records = []
-                if parsed["points"]:
-                    if self.sam is None:
-                        self.sam = SAM3(config)
-                    masks = self.sam.segment(image, parsed["points"])
-                    for m, candidate in enumerate(masks):
-                        highlighted = overlay(image, candidate["mask"], config.overlay_alpha)
-                        verification = self.ask(directory / f"verify_{frame_key}_{suffix}_{m}.json",
-                                                [highlighted], verify_prompt(obj))
-                        accepted = parse_verification(verification["text"])
-                        highlighted.thumbnail((960, 960))
-                        highlighted.save(directory / f"overlay_{frame_key}_{suffix}_{m}.jpg", quality=90)
-                        mask_records.append({"point": candidate["point"], "score": candidate["score"],
-                                             "pixels": int(candidate["mask"].sum()), "accepted": accepted,
-                                             "verification": verification["text"]})
-                        if accepted:
-                            verified |= candidate["mask"]
-                # Complete the previous projection before queuing another, so CPU
-                # work and retained masks stay bounded while overlapping GPU work.
-                if pending_projection is not None:
-                    collect_projection(pending_projection)
-                pending_projection = self.projection_pool.submit(
-                    project_and_save, verified, frame, parsed, mask_records, obj, mask_path, record_path)
-                continue
-            prefetch(job_index + 3)
+        # One vote per camera frame; hypotheses on the same frame are merged first.
+        accepted_per_frame = {}
+        localization_records = []
+
+        def collect(frame_key, record, indices):
             accepted_per_frame.setdefault(frame_key, []).append(indices)
-            fine_records.append(record)
-        if pending_projection is not None:
-            collect_projection(pending_projection)
+            localization_records.append(record)
+
+        pending = None
+        for candidate in candidates:
+            frame = candidate["frame"]
+            # Frame keys contain decimal timestamps; with_suffix() would alias frames.
+            prefix = f"{frame.key}_{hypothesis_suffix(candidate['hypothesis'])}"
+            record_path = directory / f"localize_{prefix}.json"
+            mask_path = directory / f"localize_{prefix}.npz"
+            if record_path.exists() and mask_path.exists():
+                with np.load(mask_path, allow_pickle=False) as saved:
+                    collect(frame.key, read_json(record_path), saved["indices"])
+                continue
+            record, verified = self.localize(directory, task, candidate, prefix)
+            # Complete the previous projection before queuing another, so CPU
+            # work and retained masks stay bounded while overlapping GPU work.
+            if pending is not None:
+                collect(pending[0], *pending[1].result())
+            pending = (frame.key, self.projection_pool.submit(
+                self.project_and_save, record, verified, frame, mask_path, record_path))
+        if pending is not None:
+            collect(pending[0], *pending[1].result())
+        votes = np.zeros(len(scene.xyz), dtype=np.uint32)
         for chunks in accepted_per_frame.values():
-            indices = np.unique(np.concatenate(chunks))
-            votes[indices] += 1
+            votes[np.unique(np.concatenate(chunks))] += 1
         prediction = agreement(votes, config.agreement_threshold)
         summary = {"visit_id": scene.visit_id, "desc_id": description["desc_id"],
-                   "coarse_calls": len(coarse_records), "fine_candidates": len(candidates),
+                   "selection_calls": len(selection_records),
+                   "invalid_selection_calls": sum(r["error"] is not None for r in selection_records),
+                   "candidates": len(candidates),
                    "frames_with_accepted_points": sum(any(len(x) for x in xs) for xs in accepted_per_frame.values()),
                    "max_votes": int(votes.max(initial=0)), "predicted_points": len(prediction),
-                   "seconds_this_invocation": time.monotonic() - started,
-                   "projection_cache": {"hits": self.projection_cache.hits,
-                                        "misses": self.projection_cache.misses,
-                                        "bytes": self.projection_cache.bytes},
-                   "fine": fine_records}
-        if self.qwen is not None and hasattr(self.qwen, "visual_cache"):
+                   "localization": localization_records}
+        nz = np.flatnonzero(votes)
+        np.savez_compressed(directory / "votes.npz", indices=nz, votes=votes[nz], n_points=len(votes))
+        summary["seconds_this_invocation"] = time.monotonic() - started
+        summary["projection_cache"] = {"hits": self.projection_cache.hits, "misses": self.projection_cache.misses,
+                                       "bytes": self.projection_cache.bytes}
+        if self.qwen is not None:
             summary["visual_cache"] = {"hits": self.qwen.visual_cache.hits,
                                        "misses": self.qwen.visual_cache.misses,
                                        "bytes": self.qwen.visual_cache.bytes}
         write_json(directory / "summary.json", summary, pretty=True)
-        nz = np.flatnonzero(votes)
-        np.savez_compressed(directory / "votes.npz", indices=nz, votes=votes[nz], n_points=len(votes))
         return {"desc_id": description["desc_id"], "pred_mask": prediction.tolist()}
 
     def run(self, root, split, visits, limit_queries=0, desc_ids=None):
         pred_dir = self.output / "predictions"
         pred_dir.mkdir(exist_ok=True)
         for visit in visits:
-            self.coarse_images.clear()
+            self.images.clear()
             self.projection_cache = None
             if self.qwen is not None:
                 self.qwen.visual_cache.clear()

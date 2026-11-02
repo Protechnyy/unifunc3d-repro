@@ -1,14 +1,12 @@
 {
   "qwen_model": "models/Qwen3-VL-8B-Instruct",
-  "coarse_frames": 64,
+  "frames_per_round": 64,
   "iterations": 4,
-  "coarse_width": 512,
-  "coarse_height": 384,
-  "fine_max_pixels": 2764800,
+  "max_pixels": 2764800,
   "sam_confidence": 0.5,
   "overlay_alpha": 0.7,
   "agreement_threshold": 0.7,
-  "max_fine_frames": 0,
-  "max_videos": 0,
-  "part_aware_prompt": true
+  "max_new_tokens": 512,
+  "max_selected_frames": 4,
+  "max_videos": 0
 }

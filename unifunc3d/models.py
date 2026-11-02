@@ -23,36 +23,54 @@ class Qwen:
             visual = self.model.model.visual
             visual.patch_embed = LinearPatchEmbedding(visual.patch_embed)
         from .feature_cache import VisualFeatureCache
-        self.visual_cache = VisualFeatureCache(self.model.model.get_image_features)
+        self.encoder = self.model.model.get_image_features
+        self.per_image = False
+        self.visual_cache = VisualFeatureCache(self.encode)
         self.model.model.get_image_features = self.visual_cache
 
-    def ask(self, images, prompt, tagged=False, max_pixels=None):
+    def encode(self, pixel_values, image_grid_thw=None):
+        import torch
+        if not self.per_image:
+            return self.encoder(pixel_values, image_grid_thw)
+        # ViT attention is per image, so encoding one image at a time is equivalent and lowers peak memory.
+        embeds, deepstack = [], []
+        for pixels, grid in zip(torch.split(pixel_values, image_grid_thw.prod(-1).tolist()), image_grid_thw):
+            image_embeds, deepstack_embeds = self.encoder(pixels, grid[None])
+            embeds.extend(image_embeds)
+            deepstack.append(deepstack_embeds)
+        return tuple(embeds), [torch.cat(level) for level in zip(*deepstack)]
+
+    def ask(self, images, prompt, labels=None, cache=False, long_context=False):
         import torch
         from .feature_cache import image_key
-        # Coarse image groups repeat across descriptions within the same scene.
-        # Fine/overlay images bypass this cache to preserve space for those groups.
-        self.visual_cache.key = image_key(images, max_pixels) if tagged else None
+        if labels is not None and len(labels) != len(images):
+            raise ValueError("Need exactly one label per image")
+        # 64 original frames are ~170k tokens: encode images one by one and keep the KV cache on CPU.
+        self.per_image = long_context
+        options = {"cache_implementation": "offloaded"} if long_context else {}
+        # Selection image groups repeat across descriptions within the same scene.
+        # Localization/overlay images bypass this cache to preserve space for those groups.
+        self.visual_cache.key = image_key(images, self.config.max_pixels) if cache else None
         content = []
         for i in range(len(images)):
-            if tagged:
-                content.append({"type": "text", "text": f"<frame {i}>:"})
+            if labels is not None:
+                content.append({"type": "text", "text": labels[i]})
             content.append({"type": "image"})
         content.append({"type": "text", "text": prompt})
         messages = [{"role": "user", "content": content}]
         text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = self.processor(text=[text], images=images, return_tensors="pt",
                                 min_pixels=32 * 32 * 4,
-                                max_pixels=max_pixels or self.config.fine_max_pixels).to("cuda")
+                                max_pixels=self.config.max_pixels).to("cuda")
         length = inputs.input_ids.shape[1]
         started = time.monotonic()
         with torch.inference_mode():
             output = self.model.generate(**inputs, max_new_tokens=self.config.max_new_tokens,
-                                         do_sample=False, use_cache=True)
+                                         do_sample=False, use_cache=True, **options)
         answer = self.processor.batch_decode(output[:, length:], skip_special_tokens=True)[0].strip()
         log.info("Qwen %d images / %d tokens / %.1fs: %s", len(images), length,
                  time.monotonic() - started, answer)
         return {"text": answer, "input_tokens": length, "seconds": time.monotonic() - started}
-
 
 
 class SAM3:
