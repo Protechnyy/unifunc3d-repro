@@ -22,16 +22,11 @@ class Qwen:
             from .torch_utils import LinearPatchEmbedding
             visual = self.model.model.visual
             visual.patch_embed = LinearPatchEmbedding(visual.patch_embed)
-        from .feature_cache import VisualFeatureCache
         self.encoder = self.model.model.get_image_features
-        self.per_image = False
-        self.visual_cache = VisualFeatureCache(self.encode)
-        self.model.model.get_image_features = self.visual_cache
+        self.model.model.get_image_features = self.encode
 
     def encode(self, pixel_values, image_grid_thw=None):
         import torch
-        if not self.per_image:
-            return self.encoder(pixel_values, image_grid_thw)
         # ViT attention is per image, so encoding one image at a time is equivalent and lowers peak memory.
         embeds, deepstack = [], []
         for pixels, grid in zip(torch.split(pixel_values, image_grid_thw.prod(-1).tolist()), image_grid_thw):
@@ -40,17 +35,10 @@ class Qwen:
             deepstack.append(deepstack_embeds)
         return tuple(embeds), [torch.cat(level) for level in zip(*deepstack)]
 
-    def ask(self, images, prompt, labels=None, cache=False, long_context=False):
+    def ask(self, images, prompt, labels=None):
         import torch
-        from .feature_cache import image_key
         if labels is not None and len(labels) != len(images):
             raise ValueError("Need exactly one label per image")
-        # 64 original frames are ~170k tokens: encode images one by one and keep the KV cache on CPU.
-        self.per_image = long_context
-        options = {"cache_implementation": "offloaded"} if long_context else {}
-        # Selection image groups repeat across descriptions within the same scene.
-        # Localization/overlay images bypass this cache to preserve space for those groups.
-        self.visual_cache.key = image_key(images, self.config.max_pixels) if cache else None
         content = []
         for i in range(len(images)):
             if labels is not None:
@@ -66,7 +54,7 @@ class Qwen:
         started = time.monotonic()
         with torch.inference_mode():
             output = self.model.generate(**inputs, max_new_tokens=self.config.max_new_tokens,
-                                         do_sample=False, use_cache=True, **options)
+                                         do_sample=False, use_cache=True)
         answer = self.processor.batch_decode(output[:, length:], skip_special_tokens=True)[0].strip()
         log.info("Qwen %d images / %d tokens / %.1fs: %s", len(images), length,
                  time.monotonic() - started, answer)

@@ -84,8 +84,7 @@ class Pipeline:
                 if not path.exists():
                     images = self.images.get([frames[i] for i in sampled], config.upright)
                 response = self.ask(path, images, selection_prompt(task),
-                                    labels=[f"<frame {i}>:" for i in range(len(sampled))], cache=True,
-                                    long_context=True)
+                                    labels=[f"<frame {i}>:" for i in range(len(sampled))])
                 parsed = parse_selection(response["text"], len(sampled), config.max_selected_frames)
                 records.append({"video_id": video_id, "iteration": iteration, "sampled_indices": sampled,
                                 **parsed, "frames": [frames[sampled[i]].key for i in parsed["frame_ids"]]})
@@ -200,10 +199,6 @@ class Pipeline:
         summary["seconds_this_invocation"] = time.monotonic() - started
         summary["projection_cache"] = {"hits": self.projection_cache.hits, "misses": self.projection_cache.misses,
                                        "bytes": self.projection_cache.bytes}
-        if self.qwen is not None:
-            summary["visual_cache"] = {"hits": self.qwen.visual_cache.hits,
-                                       "misses": self.qwen.visual_cache.misses,
-                                       "bytes": self.qwen.visual_cache.bytes}
         write_json(directory / "summary.json", summary, pretty=True)
         return {"desc_id": description["desc_id"], "pred_mask": prediction.tolist()}
 
@@ -213,8 +208,6 @@ class Pipeline:
         for visit in visits:
             self.images.clear()
             self.projection_cache = None
-            if self.qwen is not None:
-                self.qwen.visual_cache.clear()
             scene = InputScene(root, split, visit, self.config.max_videos)
             snapshot = {"dataset_root": str(Path(root).resolve()), "split": split,
                         "n_points": len(scene.xyz), "files": {}}
